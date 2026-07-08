@@ -78,12 +78,41 @@ sw.from_mne(epochs)                                       # MNE Epochs
 sw.from_yasa(spindles_df, raw_signal, sfreq=256)          # YASA output
 sw.from_luna("spindles.txt", "recording.edf", sfreq=256)  # Luna output + EDF
 sw.from_edf_batch(["s1.edf", "s2.edf"], channel="C3")     # detect + pool across files
+sw.from_lwf("spindles.lwf")                               # Luna .lwf waveform export
 ```
 
 `from_edf_batch` runs a detector (default YASA) on every EDF, extracts windows
 around each peak, and returns a single `EventMatrix` with a `.meta` DataFrame
 recording `subject`, `file`, `event_index`, and `peak_sec` for each pooled
 event.
+
+### Luna `.lwf` files
+
+`from_lwf` reads Luna's binary `.lwf` waveform export directly (no optional
+dependencies required) and returns an `AxisAnnotatedTensor` with axes
+`['instance', 'channel', 'sample']`, preserving per-channel labels/units/sample
+rates and rich per-event metadata (annotation, instance, anchor and timing
+columns):
+
+```python
+aat = sw.from_lwf("spindles.lwf")          # a single file
+aat = sw.from_lwf(["s1.lwf", "s2.lwf"])    # several files, concatenated
+aat = sw.from_lwf("exports/", recur=True)  # every .lwf under a directory
+
+aat.shape                                  # (n_events, n_channels, n_samples)
+aat.axis_meta["instance"]                  # per-event DataFrame (id, annot, timing, …)
+aat.axis_meta["channel"]                   # label, unit, sr per channel
+result = sw.decompose(aat, method="svd", n_components=5)
+```
+
+All files must share the same channel labels and sample rates, and every event
+must have the same number of samples (Luna's `require=full` windows). To inspect
+files without loading any signal data, use `lwf_summary`:
+
+```python
+df = sw.lwf_summary("exports/", recur=True)
+# One row per file: id, tag, startdate, n_waves, n_channels, channels, srs, …
+```
 
 ## Decomposition methods
 
@@ -107,6 +136,7 @@ result.temporal_factors     # (n_samples, rank)
 result.spatial_factors      # (n_channels, rank)
 result.reconstruction_error # ||X - X_hat|| / ||X||
 result.component_waveform(0, channel=1)   # template scaled by channel weight
+result.plot()                             # per-component temporal / spatial / loading panels
 ```
 
 Requires `subwave[tensor]`.

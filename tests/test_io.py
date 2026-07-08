@@ -26,6 +26,26 @@ class TestFromArray:
         assert em.n_samples == 3
 
 
+class TestDecomposeEventMatrix:
+    def test_decompose_dispatches_to_event_matrix(self, event_matrix):
+        """sw.decompose() accepts an EventMatrix and routes through its own
+        decompose() method (core.decompose EventMatrix branch)."""
+        import subwave as sw
+        from subwave.result import DecompositionResult
+
+        result = sw.decompose(event_matrix, method="svd", n_components=3)
+        assert isinstance(result, DecompositionResult)
+        assert result.templates.shape == (3, event_matrix.n_samples)
+        assert result.loadings.shape == (event_matrix.n_events, 3)
+
+    def test_matches_direct_event_matrix_decompose(self, event_matrix):
+        import subwave as sw
+
+        via_dispatch = sw.decompose(event_matrix, method="svd", n_components=2)
+        direct = event_matrix.decompose(method="svd", n_components=2)
+        np.testing.assert_allclose(via_dispatch.templates, direct.templates)
+
+
 class TestFromNpz:
     def test_returns_aat(self, spindle_path):
         aat = from_npz(spindle_path)

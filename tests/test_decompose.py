@@ -1,8 +1,43 @@
 import numpy as np
 import pytest
 
-from subwave import from_array
+from subwave import AxisAnnotatedTensor, decompose, from_array
 from subwave.core import EventMatrix
+
+
+# ---------------------------------------------------------------------------
+# decompose() input dispatch / tensor rank handling
+# ---------------------------------------------------------------------------
+
+class TestDecomposeFunction:
+    def _aat_3d(self, rng, n=20, n_samples=16, n_channels=3):
+        X = rng.standard_normal((n, n_channels, n_samples))
+        return AxisAnnotatedTensor(
+            data=X,
+            axes=["instance", "channel", "sample"],
+            attrs={"sfreq": 64.0},
+        )
+
+    def test_3d_tensor_flattened(self, rng):
+        """3-D input is reshaped to (n_events, channels*samples)."""
+        aat = self._aat_3d(rng, n=20, n_samples=16, n_channels=3)
+        result = decompose(aat, method="svd", n_components=4)
+        assert result.templates.shape == (4, 3 * 16)
+        assert result.loadings.shape == (20, 4)
+
+    def test_3d_requires_instance_axis_first(self, rng):
+        X = rng.standard_normal((16, 20, 3))
+        aat = AxisAnnotatedTensor(
+            data=X,
+            axes=["sample", "instance", "channel"],
+            attrs={"sfreq": 64.0},
+        )
+        with pytest.raises(ValueError, match="instance axis must be axis 0"):
+            decompose(aat, method="svd", n_components=2)
+
+    def test_raw_input_must_be_2d(self, rng):
+        with pytest.raises(ValueError, match="2-D"):
+            decompose(rng.standard_normal((2, 3, 4)), method="svd", n_components=2)
 
 
 # ---------------------------------------------------------------------------

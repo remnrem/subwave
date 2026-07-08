@@ -173,7 +173,7 @@ def plot_loadings_by_group(result, groups, comp: int = 0, kind: str = "box", ax=
     if kind == "violin":
         ax.violinplot(data, positions=positions, showmedians=True)
     elif kind == "box":
-        ax.boxplot(data, positions=positions, labels=[str(l) for l in labels])
+        ax.boxplot(data, positions=positions, tick_labels=[str(l) for l in labels])
     else:
         raise ValueError(f"kind must be 'box' or 'violin', got {kind!r}")
     ax.set_xticks(positions)
