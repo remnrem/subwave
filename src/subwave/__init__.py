@@ -3,7 +3,7 @@ from .comparison import PermutationResult, permutation_test, subspace_angles
 from .core import EventMatrix, decompose
 from .dataset import TensorDataset, TensorView, concat_datasets, make_dataset
 from .io import from_array, from_edf_batch, from_luna, from_mne, from_npz, from_yasa
-from .lwf import from_lwf, lwf_summary
+from .lwf import from_lwf, lwf_summary, lwf_event_counts, LwfSummary
 from .result import DecompositionResult
 from .selection import elbow, kaiser, parallel_analysis, select_n_components
 from .tensor import AxisAnnotatedTensor
@@ -32,6 +32,8 @@ __all__ = [
     "from_edf_batch",
     "from_lwf",
     "lwf_summary",
+    "lwf_event_counts",
+    "LwfSummary",
     # Component selection
     "elbow",
     "kaiser",

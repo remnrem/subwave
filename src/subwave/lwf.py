@@ -89,10 +89,76 @@ def _read_header(f) -> dict:
     }
 
 # ---------------------------------------------------------------------------
+# Index entry reader  (one event's index record; leaves cursor at the next one)
+# ---------------------------------------------------------------------------
+
+def _read_index_entry(f) -> dict:
+    """Read a single index record without touching the payload section.
+
+    Returns the per-event fields plus ``n_blocks``, ``payload_offset`` (absolute
+    file offset of the event's payload) and ``ns`` (samples in the first block).
+    """
+    annot    = _read_string(f)
+    instance = _read_string(f)
+    annot_ch = _read_string(f)
+    annot_start = _read_f64(f)
+    annot_stop  = _read_f64(f)
+    anchor      = _read_f64(f)
+    wave_start  = _read_f64(f)
+    wave_stop   = _read_f64(f)
+    payload_offset = _read_u64(f)   # absolute file offset of this wave's payload
+
+    n_blocks = _read_i32(f)
+    ns_first: int | None = None
+    for b in range(n_blocks):
+        ns = _read_i32(f)
+        _read_f64(f)          # data_start_sec
+        _read_f64(f)          # data_stop_sec
+        if b == 0:
+            ns_first = ns
+
+    return {
+        'annot':           annot,
+        'instance':        instance,
+        'annot_ch':        annot_ch,
+        'annot_start_sec': annot_start,
+        'annot_stop_sec':  annot_stop,
+        'anchor_sec':      anchor,
+        'wave_start_sec':  wave_start,
+        'wave_stop_sec':   wave_stop,
+        'n_blocks':        n_blocks,
+        'payload_offset':  payload_offset,
+        'ns':              ns_first if ns_first is not None else 0,
+    }
+
+# ---------------------------------------------------------------------------
 # Events reader  (index section then payload section, single sequential pass)
 # ---------------------------------------------------------------------------
 
-def _read_events(f, header: dict) -> tuple[np.ndarray, pd.DataFrame]:
+def _read_events(
+    f,
+    header: dict,
+    *,
+    channels: set[str] | None = None,
+    sample_n: int | None = None,
+    sample_by: str = 'record',
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, pd.DataFrame, bool, list[str] | None]:
+    """Read the events of a single file.
+
+    ``channels`` restricts what is loaded.  In annot-ch-match files (one block
+    per event) it keeps only events whose detecting channel (``annot_ch``) is in
+    the set.  In standard files (all channels per event) it selects the matching
+    channel *blocks* instead, narrowing the channel axis.
+
+    ``sample_n`` randomly keeps at most that many events from this file, drawn
+    (without replacement) *after* any channel-based event filtering, using
+    ``rng``.  ``sample_by`` controls the draw in annot-ch-match files:
+    ``'record'`` keeps N events total (channel mix follows prevalence);
+    ``'channel'`` keeps up to N events for *each* detecting channel (balanced).
+    In standard files every event already carries all channels, so ``sample_by``
+    has no effect there.
+    """
     n_waves    = header['n_waves']
     n_ch       = len(header['channels'])
     n_features = len(header['feature_names'])
@@ -106,29 +172,11 @@ def _read_events(f, header: dict) -> tuple[np.ndarray, pd.DataFrame]:
     annot_ch_match = False  # detected if any event has fewer blocks than channels
 
     for w in range(n_waves):
-        annot    = _read_string(f)
-        instance = _read_string(f)
-        annot_ch = _read_string(f)
-        annot_start = _read_f64(f)
-        annot_stop  = _read_f64(f)
-        anchor      = _read_f64(f)
-        wave_start  = _read_f64(f)
-        wave_stop   = _read_f64(f)
-        _read_u64(f)              # payload_offset — not needed (sequential read)
-
-        n_blocks = _read_i32(f)
-        if n_blocks < n_ch:
+        e = _read_index_entry(f)
+        if e['n_blocks'] < n_ch:
             annot_ch_match = True
 
-        ns_list: list[int] = []
-        for _ in range(n_blocks):
-            ns = _read_i32(f)
-            _read_f64(f)          # data_start_sec
-            _read_f64(f)          # data_stop_sec
-            ns_list.append(ns)
-
-        ns = ns_list[0] if ns_list else 0
-
+        ns = e['ns']
         if expected_n is None:
             expected_n = ns
         elif ns != expected_n:
@@ -137,28 +185,54 @@ def _read_events(f, header: dict) -> tuple[np.ndarray, pd.DataFrame]:
                 f"got {ns} samples, expected {expected_n}"
             )
 
-        index_rows.append({
-            'annot':           annot,
-            'instance':        instance,
-            'annot_ch':        annot_ch,
-            'annot_start_sec': annot_start,
-            'annot_stop_sec':  annot_stop,
-            'anchor_sec':      anchor,
-            'wave_start_sec':  wave_start,
-            'wave_stop_sec':   wave_stop,
-            'n_blocks':        n_blocks,
-        })
+        index_rows.append(e)
 
     if expected_n is None:
         expected_n = 0
 
-    # output channels: 1 per event (annot-ch-match) or all header channels
-    out_n_ch = 1 if annot_ch_match else n_ch
-    data = np.full((n_waves, out_n_ch, expected_n), np.nan, dtype=np.float64)
+    def _draw(pool: list[int]) -> list[int]:
+        if len(pool) <= sample_n:
+            return list(pool)
+        picks = rng.choice(len(pool), size=sample_n, replace=False)
+        return [pool[i] for i in picks]
+
+    # --- select which events (waves) to keep ---
+    keep = list(range(n_waves))
+    if channels is not None and annot_ch_match:
+        keep = [w for w in keep if index_rows[w]['annot_ch'] in channels]
+    if sample_n is not None:
+        if sample_by == 'channel' and annot_ch_match:
+            groups: dict[str, list[int]] = {}
+            for w in keep:
+                groups.setdefault(index_rows[w]['annot_ch'], []).append(w)
+            kept: list[int] = []
+            for ws in groups.values():
+                kept.extend(_draw(ws))
+            keep = sorted(kept)
+        else:
+            keep = sorted(_draw(keep))
+
+    # --- select which channel blocks to keep (standard files only) ---
+    if annot_ch_match:
+        out_n_ch = 1
+        sel_labels: list[str] | None = None
+        block_to_col: dict[int, int] = {}
+    else:
+        if channels is not None:
+            sel_blocks = [i for i, c in enumerate(header['channels'])
+                          if c['label'] in channels]
+        else:
+            sel_blocks = list(range(n_ch))
+        out_n_ch = len(sel_blocks)
+        sel_labels = [header['channels'][i]['label'] for i in sel_blocks]
+        block_to_col = {b: col for col, b in enumerate(sel_blocks)}
+
+    data = np.full((len(keep), out_n_ch, expected_n), np.nan, dtype=np.float64)
     meta_col: list[str] = []
 
-    # --- pass 2: payload section ---
-    for w in range(n_waves):
+    # --- pass 2: payload section (seek to each kept wave) ---
+    for out_i, w in enumerate(keep):
+        f.seek(index_rows[w]['payload_offset'])
         meta_col.append(_read_string(f))  # meta — only in payload
         n_blocks = _read_i32(f)
 
@@ -166,22 +240,26 @@ def _read_events(f, header: dict) -> tuple[np.ndarray, pd.DataFrame]:
             if n_features > 0:
                 f.read(4 + n_features * 8)   # feature_qc (int32) + feature values (float64)
 
-            ns = index_rows[w]['n_blocks']   # same as n_blocks, use index value
-            ns = expected_n                   # uniform (validated above)
-            raw = f.read(ns * 2)             # int16 = 2 bytes
+            raw = f.read(expected_n * 2)     # int16 = 2 bytes; uniform ns (validated)
 
-            # determine which channel this block belongs to
             if annot_ch_match:
                 label = index_rows[w]['annot_ch']
-            else:
+                phys_min, phys_max = ch_phys.get(label, (0.0, 1.0))
+                data[out_i, 0, :] = _decode_int16(raw, phys_min, phys_max)
+            elif b in block_to_col:
                 label = header['channels'][b]['label']
+                phys_min, phys_max = ch_phys.get(label, (0.0, 1.0))
+                data[out_i, block_to_col[b], :] = _decode_int16(raw, phys_min, phys_max)
 
-            phys_min, phys_max = ch_phys.get(label, (0.0, 1.0))
-            data[w, b, :] = _decode_int16(raw, phys_min, phys_max)
-
-    event_meta = pd.DataFrame(index_rows).drop(columns=['n_blocks'])
+    index_cols = ['annot', 'instance', 'annot_ch', 'annot_start_sec',
+                  'annot_stop_sec', 'anchor_sec', 'wave_start_sec', 'wave_stop_sec']
+    kept_rows = [index_rows[w] for w in keep]
+    if kept_rows:
+        event_meta = pd.DataFrame(kept_rows)[index_cols]
+    else:
+        event_meta = pd.DataFrame(columns=index_cols)
     event_meta['meta'] = meta_col
-    return data, event_meta, annot_ch_match
+    return data, event_meta, annot_ch_match, sel_labels
 
 # ---------------------------------------------------------------------------
 # Path resolution
@@ -211,11 +289,47 @@ def _resolve_paths(
 # Public API
 # ---------------------------------------------------------------------------
 
+class LwfSummary(pd.DataFrame):
+    """A per-file .lwf summary table (see :func:`lwf_summary`).
+
+    Behaves as an ordinary :class:`pandas.DataFrame`, with an extra
+    :meth:`summary` method that collapses the rows into a whole-sample overview.
+    """
+
+    @property
+    def _constructor(self):
+        return LwfSummary
+
+    def summary(self) -> pd.Series:
+        """Collapse the per-file rows into one whole-sample overview.
+
+        Returns a :class:`pandas.Series` with the total number of files,
+        subjects (unique ``id``), events, unique channels, per-event sample
+        length, and the estimated full-load memory footprint.
+        """
+        chans = sorted({c for row in self['channels'] for c in row.split(',') if c})
+        n_samp = sorted(set(int(x) for x in self['n_samples']))
+        acm = sorted(set(bool(x) for x in self['annot_ch_match']))
+        total_bytes = int(self['est_bytes'].sum())
+        return pd.Series({
+            'files':             len(self),
+            'subjects':          int(self['id'].nunique()),
+            'events':            int(self['n_waves'].sum()),
+            'channels':          len(chans),
+            'channel_labels':    ','.join(chans),
+            'samples_per_event': n_samp[0] if len(n_samp) == 1 else 'varies',
+            'annot_ch_match':    acm[0] if len(acm) == 1 else 'mixed',
+            'est_bytes':         total_bytes,
+            'est_mb':            round(total_bytes / 1024**2, 2),
+            'est_gb':            round(total_bytes / 1024**3, 2),
+        })
+
+
 def lwf_summary(
     paths: Union[str, Path, Iterable],
     *,
     recur: bool = False,
-) -> pd.DataFrame:
+) -> LwfSummary:
     """Summarise one or more .lwf files without loading signal data.
 
     Parameters
@@ -228,30 +342,96 @@ def lwf_summary(
 
     Returns
     -------
-    pandas.DataFrame with one row per file and columns:
+    LwfSummary (a pandas.DataFrame subclass) with one row per file and columns:
     ``file``, ``id``, ``tag``, ``startdate``, ``starttime``, ``align``,
     ``n_waves``, ``n_channels``, ``channels``, ``srs``, ``annots``,
-    ``n_features``.
+    ``n_features``, ``n_samples``, ``annot_ch_match``, ``est_bytes``,
+    ``est_mb``.
+
+    ``n_samples`` is the per-event waveform length and ``est_bytes`` /
+    ``est_mb`` estimate the in-memory (float64) size of loading the whole file
+    with :func:`from_lwf` (``n_waves * out_channels * n_samples * 8``).  These
+    come from a cheap peek at the first index record, not a full load.
+
+    Call ``.summary()`` on the result for a whole-sample overview (total files,
+    subjects, events, unique channels, total memory).
     """
     files = _resolve_paths(paths, recur)
     rows = []
     for p in files:
         with open(p, 'rb') as f:
             h = _read_header(f)
+            if h['n_waves'] > 0:
+                e0 = _read_index_entry(f)
+                n_samples = e0['ns']
+                annot_ch_match = e0['n_blocks'] < len(h['channels'])
+            else:
+                n_samples = 0
+                annot_ch_match = False
+        out_n_ch = 1 if annot_ch_match else len(h['channels'])
+        est_bytes = h['n_waves'] * out_n_ch * n_samples * 8
         rows.append({
-            'file':       str(p),
-            'id':         h['id'],
-            'tag':        h['tag'],
-            'startdate':  h['startdate'],
-            'starttime':  h['starttime'],
-            'align':      h['align'],
-            'n_waves':    h['n_waves'],
-            'n_channels': len(h['channels']),
-            'channels':   ','.join(c['label'] for c in h['channels']),
-            'srs':        ','.join(str(c['sr']) for c in h['channels']),
-            'annots':     ','.join(h['annots']),
-            'n_features': len(h['feature_names']),
+            'file':           str(p),
+            'id':             h['id'],
+            'tag':            h['tag'],
+            'startdate':      h['startdate'],
+            'starttime':      h['starttime'],
+            'align':          h['align'],
+            'n_waves':        h['n_waves'],
+            'n_channels':     len(h['channels']),
+            'channels':       ','.join(c['label'] for c in h['channels']),
+            'srs':            ','.join(str(c['sr']) for c in h['channels']),
+            'annots':         ','.join(h['annots']),
+            'n_features':     len(h['feature_names']),
+            'n_samples':      n_samples,
+            'annot_ch_match': annot_ch_match,
+            'est_bytes':      est_bytes,
+            'est_mb':         round(est_bytes / 1024**2, 2),
         })
+    return LwfSummary(rows)
+
+
+def lwf_event_counts(
+    paths: Union[str, Path, Iterable],
+    *,
+    recur: bool = False,
+) -> pd.DataFrame:
+    """Count events per detecting channel without loading signal data.
+
+    Scans the (small) index section of each file — no waveform payloads are
+    decoded — and reports how many events are associated with each ``annot_ch``.
+    Useful for planning a load, e.g. deciding ``sample_n`` / ``sample_by`` in
+    :func:`from_lwf`.
+
+    Parameters
+    ----------
+    paths:
+        A .lwf file path, a directory containing .lwf files, or a list of
+        either.
+    recur:
+        Recurse into subdirectories when *paths* contains a directory.
+
+    Returns
+    -------
+    pandas.DataFrame in long form with one row per (file, channel):
+    ``file``, ``id``, ``annot_ch``, ``n_events``.
+    """
+    files = _resolve_paths(paths, recur)
+    rows = []
+    for p in files:
+        with open(p, 'rb') as f:
+            h = _read_header(f)
+            counts: dict[str, int] = {}
+            for _ in range(h['n_waves']):
+                e = _read_index_entry(f)
+                counts[e['annot_ch']] = counts.get(e['annot_ch'], 0) + 1
+        for ch, n in sorted(counts.items()):
+            rows.append({
+                'file':     str(p),
+                'id':       h['id'],
+                'annot_ch': ch,
+                'n_events': n,
+            })
     return pd.DataFrame(rows)
 
 
@@ -259,6 +439,10 @@ def from_lwf(
     paths: Union[str, Path, Iterable],
     *,
     recur: bool = False,
+    channels: Union[str, Iterable[str], None] = None,
+    sample_n: int | None = None,
+    sample_by: str = 'record',
+    seed: int | None = None,
 ) -> AxisAnnotatedTensor:
     """Load one or more .lwf files into an AxisAnnotatedTensor.
 
@@ -278,12 +462,36 @@ def from_lwf(
         either.
     recur:
         Recurse into subdirectories when *paths* contains a directory.
+    channels:
+        Restrict which channels are loaded (a label or an iterable of labels).
+        In annot-ch-match files this keeps only events whose detecting channel
+        (``annot_ch``) is one of ``channels``.  In standard files it selects
+        the matching channel blocks, narrowing the channel axis.  ``None``
+        (default) loads everything.
+    sample_n:
+        If given, randomly keep at most this many events, drawn without
+        replacement after any ``channels`` filtering.  Groups with fewer events
+        are loaded in full.
+    sample_by:
+        Grouping for ``sample_n`` in annot-ch-match files: ``'record'``
+        (default) keeps N events per file (channel mix follows prevalence);
+        ``'channel'`` keeps up to N events per detecting channel *per file*
+        (balanced across channels).  Ignored for standard files, where every
+        event already carries all channels.
+    seed:
+        Seed for the ``sample_n`` random draw, for reproducibility.
 
     Returns
     -------
     AxisAnnotatedTensor with axes ``['instance', 'channel', 'sample']``.
     """
     files = _resolve_paths(paths, recur)
+
+    if channels is not None:
+        channels = {channels} if isinstance(channels, str) else set(channels)
+    if sample_by not in ('record', 'channel'):
+        raise ValueError(f"sample_by must be 'record' or 'channel', got {sample_by!r}")
+    rng = np.random.default_rng(seed) if sample_n is not None else None
 
     # --- pass 1: read all headers and validate consistency ---
     headers: list[dict] = []
@@ -305,7 +513,18 @@ def from_lwf(
                 f"  {h['_path']}: {sig}"
             )
 
-    all_srs = [c['sr'] for c in ref_ch]
+    if channels is not None:
+        avail = {c['label'] for c in ref_ch}
+        missing = channels - avail
+        if missing:
+            raise ValueError(
+                f"requested channel(s) not present: {sorted(missing)}; "
+                f"available: {sorted(avail)}"
+            )
+
+    # when selecting a channel subset, only those channels' sample rates matter
+    sel_ch = [c for c in ref_ch if channels is None or c['label'] in channels]
+    all_srs = [c['sr'] for c in sel_ch]
     if len(set(all_srs)) > 1:
         raise ValueError(
             f"channels have mixed sample rates {all_srs}; "
@@ -320,11 +539,17 @@ def from_lwf(
     all_meta:  list[pd.DataFrame] = []
     expected_n: int | None = None
     detected_annot_ch_match: bool | None = None
+    sel_labels: list[str] | None = None
 
     for h in headers:
         with open(h['_path'], 'rb') as f:
             _read_header(f)
-            data, event_meta, annot_ch_match = _read_events(f, h)
+            data, event_meta, annot_ch_match, file_sel_labels = _read_events(
+                f, h, channels=channels, sample_n=sample_n,
+                sample_by=sample_by, rng=rng,
+            )
+        if file_sel_labels is not None:
+            sel_labels = file_sel_labels
 
         if detected_annot_ch_match is None:
             detected_annot_ch_match = annot_ch_match
@@ -372,10 +597,12 @@ def from_lwf(
     if detected_annot_ch_match:
         ch_meta = pd.DataFrame([{'label': '(annot_ch)', 'unit': '', 'sr': sr}])
     else:
+        lbl_map = {c['label']: c for c in ref_ch}
+        labels = sel_labels if sel_labels is not None else [c['label'] for c in ref_ch]
         ch_meta = pd.DataFrame({
-            'label': [c['label'] for c in ref_ch],
-            'unit':  [c['unit']  for c in ref_ch],
-            'sr':    [c['sr']    for c in ref_ch],
+            'label': labels,
+            'unit':  [lbl_map[l]['unit'] for l in labels],
+            'sr':    [lbl_map[l]['sr']   for l in labels],
         })
 
     col_order = [
